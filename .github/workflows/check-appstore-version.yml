@@ -1,0 +1,109 @@
+name: App Store Version Check & Notify
+
+on:
+  schedule:
+    - cron: '0 8 * * *' # täglich 8 Uhr UTC
+  workflow_dispatch:
+
+jobs:
+  check-and-notify:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: App Store Version prüfen
+        id: version
+        run: |
+          RESPONSE=$(curl -s "https://itunes.apple.com/lookup?bundleId=${{ vars.BUNDLE_ID }}")
+          NEW=$(echo "$RESPONSE" | jq -r '.results[0].version')
+          if [ -z "$NEW" ] || [ "$NEW" = "null" ]; then
+            echo "App nicht gefunden – Bundle ID prüfen" && exit 1
+          fi
+          echo "new=$NEW" >> $GITHUB_OUTPUT
+          echo "last=${{ vars.LAST_APP_VERSION }}" >> $GITHUB_OUTPUT
+
+      - name: Keine neue Version → abbrechen
+        if: steps.version.outputs.new == steps.version.outputs.last
+        run: echo "Keine neue Version (${{ steps.version.outputs.last }}). Fertig." && exit 0
+
+      - name: Kontakte laden & Mails versenden
+        if: steps.version.outputs.new != steps.version.outputs.last
+        env:
+          BREVO_KEY: ${{ secrets.BREVO_API_KEY }}
+          LIST_ID: ${{ vars.BREVO_LIST_ID }}
+          SENDER_EMAIL: ${{ vars.SENDER_EMAIL }}
+          SENDER_NAME: ${{ vars.SENDER_NAME }}
+          NEW_VERSION: ${{ steps.version.outputs.new }}
+          # HTML als einzeiligen String in der Variable speichern
+          EMAIL_HTML: ${{ vars.EMAIL_HTML }}
+        run: |
+          node << 'EOF'
+          const https = require('https');
+
+          function request(method, path, body, headers) {
+            return new Promise((resolve, reject) => {
+              const req = https.request(
+                { hostname: 'api.brevo.com', path, method, headers },
+                (res) => {
+                  let data = '';
+                  res.on('data', (c) => (data += c));
+                  res.on('end', () => resolve({ status: res.statusCode, body: data }));
+                }
+              );
+              req.on('error', reject);
+              if (body) req.write(JSON.stringify(body));
+              req.end();
+            });
+          }
+
+          const headers = {
+            'api-key': process.env.BREVO_KEY,
+            'Content-Type': 'application/json',
+          };
+
+          async function getAllContacts() {
+            let offset = 0;
+            const limit = 50;
+            const emails = [];
+            while (true) {
+              const res = await request(
+                'GET',
+                `/v3/contacts/lists/${process.env.LIST_ID}/contacts?limit=${limit}&offset=${offset}`,
+                null,
+                headers
+              );
+              const data = JSON.parse(res.body);
+              if (!data.contacts || data.contacts.length === 0) break;
+              data.contacts.forEach((c) => emails.push(c.email));
+              if (data.contacts.length < limit) break;
+              offset += limit;
+            }
+            return emails;
+          }
+
+          async function sendEmail(to) {
+            return request('POST', '/v3/smtp/email', {
+              sender: { name: process.env.SENDER_NAME, email: process.env.SENDER_EMAIL },
+              to: [{ email: to }],
+              subject: `Neue Version ${process.env.NEW_VERSION} verfügbar`,
+              htmlContent: process.env.EMAIL_HTML,
+            }, headers);
+          }
+
+          (async () => {
+            const emails = await getAllContacts();
+            console.log(`${emails.length} Kontakte gefunden`);
+            for (const email of emails) {
+              const res = await sendEmail(email);
+              console.log(`${email} → ${res.status}`);
+            }
+          })();
+          EOF
+
+      - name: LAST_APP_VERSION aktualisieren
+        if: steps.version.outputs.new != steps.version.outputs.last
+        run: |
+          curl -s -X PATCH \
+            -H "Authorization: Bearer ${{ secrets.PAT_TOKEN }}" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${{ github.repository }}/actions/variables/LAST_APP_VERSION" \
+            -d "{\"name\":\"LAST_APP_VERSION\",\"value\":\"${{ steps.version.outputs.new }}\"}"
